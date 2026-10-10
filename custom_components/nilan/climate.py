@@ -9,6 +9,7 @@ from homeassistant.components.climate import (
     HVACMode,
 )
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
+from homeassistant.helpers.restore_state import RestoreEntity
 
 from .__init__ import NilanEntity
 from .const import DOMAIN
@@ -24,6 +25,16 @@ STATE_TO_HVAC_MODE = {
     HVACMode.COOL: 2,
     HVACMode.AUTO: 3,
 }
+
+# Compensation de la sonde de régulation.
+# La CTS602 régule sur T15, placée dans une boîte technique (+6-7 °C), et refuse
+# le registre de choix de sonde (1208, bus v4). L'entité affiche donc T10 (air
+# extrait = moyenne réelle des pièces) et accepte une consigne "réelle" ; on
+# écrit à la carte : consigne réelle + (T_régulation - T10), arrondie au degré.
+REAL_TEMP_STEP = 0.5
+REAL_TEMP_MIN = 10
+REAL_TEMP_MAX = 28
+REWRITE_HYSTERESIS = 0.75  # évite de réécrire sans cesse quand l'écart oscille
 
 PRESET_TO_HVAC = {
     "energy": 0,
@@ -98,7 +109,7 @@ async def async_setup_entry(HomeAssistant, config_entry, async_add_entities):
     async_add_entities(entities, True)
 
 
-class NilanClimate(NilanEntity, ClimateEntity):
+class NilanClimate(NilanEntity, ClimateEntity, RestoreEntity):
     """Define a Nilan HVAC."""
 
     def __init__(self, device, supported_featrures, extra_status_attributes) -> None:
@@ -110,9 +121,12 @@ class NilanClimate(NilanEntity, ClimateEntity):
         self._hvac_on = False
         self._attr_max_humidity = 45
         self._attr_min_humidity = 15
-        self._attr_min_temp = 5
-        self._attr_max_temp = 30
-        self._attr_target_temperature_step = 1
+        self._attr_min_temp = REAL_TEMP_MIN
+        self._attr_max_temp = REAL_TEMP_MAX
+        self._attr_target_temperature_step = REAL_TEMP_STEP
+        self._target_real = None   # consigne réelle voulue (échelle T10)
+        self._offset = None        # T_régulation - T10
+        self._device_setpoint = None
         self._enable_turn_on_off_backwards_compatibility = False
         self._attr_hvac_modes = [
             HVACMode.COOL,
@@ -148,10 +162,40 @@ class NilanClimate(NilanEntity, ClimateEntity):
         self._attr_hvac_mode = hvac_mode
         self.async_write_ha_state()
 
+    async def async_added_to_hass(self) -> None:
+        """Restore the real (T10-scale) target after a restart."""
+        await super().async_added_to_hass()
+        last = await self.async_get_last_state()
+        if last is not None:
+            # attribut dédié : l'ancienne "temperature" était sur l'échelle T15
+            value = last.attributes.get("consigne_reelle")
+            if isinstance(value, (int, float)):
+                self._target_real = float(value)
+
+    def _device_target(self) -> int | None:
+        """Setpoint to send to the controller for the current real target."""
+        if self._target_real is None or self._offset is None:
+            return None
+        return int(max(5, min(30, round(self._target_real + self._offset))))
+
     async def async_set_temperature(self, **kwargs):
-        """Set new target temperature."""
-        await self._device.set_user_temperature_setpoint(kwargs[ATTR_TEMPERATURE])
+        """Set new real target temperature (T10 scale)."""
+        self._target_real = float(kwargs[ATTR_TEMPERATURE])
+        self._attr_target_temperature = self._target_real
+        target = self._device_target()
+        if target is not None:
+            await self._device.set_user_temperature_setpoint(target)
+            self._device_setpoint = target
         self.async_write_ha_state()
+
+    @property
+    def extra_state_attributes(self):
+        """Expose the compensation internals."""
+        return {
+            "consigne_reelle": self._target_real,
+            "consigne_envoyee_nilan": self._device_setpoint,
+            "ecart_regulation_t10": None if self._offset is None else round(self._offset, 1),
+        }
 
     async def async_set_humidity(self, humidity):
         """Set new target temperature."""
@@ -164,12 +208,30 @@ class NilanClimate(NilanEntity, ClimateEntity):
         self._attr_fan_mode = str(await self._device.get_ventilation_step())
 
         if self._attr_supported_features & ClimateEntityFeature.TARGET_TEMPERATURE:
-            self._attr_target_temperature = (
-                await self._device.get_user_temperature_setpoint()
-            )
-            self._attr_current_temperature = (
-                await self._device.get_control_temperature()
-            )
+            self._device_setpoint = await self._device.get_user_temperature_setpoint()
+            control_temp = await self._device.get_control_temperature()
+            t10 = await self._device.get_t10_external_temperature()
+            if control_temp is not None and t10 is not None:
+                self._offset = control_temp - t10
+                self._attr_current_temperature = t10
+                if self._target_real is None and self._device_setpoint is not None:
+                    # premier démarrage : on reprend la consigne actuelle de la carte
+                    self._target_real = round(
+                        (self._device_setpoint - self._offset) / REAL_TEMP_STEP
+                    ) * REAL_TEMP_STEP
+                self._attr_target_temperature = self._target_real
+                wanted = self._target_real + self._offset
+                if (
+                    self._device_setpoint is not None
+                    and abs(wanted - self._device_setpoint) > REWRITE_HYSTERESIS
+                ):
+                    target = self._device_target()
+                    await self._device.set_user_temperature_setpoint(target)
+                    self._device_setpoint = target
+            else:
+                # sondes indisponibles : comportement d'origine
+                self._attr_target_temperature = self._device_setpoint
+                self._attr_current_temperature = control_temp
 
         if self._attr_supported_features & ClimateEntityFeature.TARGET_HUMIDITY:
             self._attr_current_humidity = await self._device.get_humidity()
